@@ -9,7 +9,33 @@ from flask_cors import CORS
 import sys
 import warnings
 import datetime
+import re
 warnings.filterwarnings('ignore')
+
+# Stock data download libraries
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+
+try:
+    import akshare as ak
+    AKSHARE_AVAILABLE = True
+except ImportError:
+    AKSHARE_AVAILABLE = False
+
+try:
+    from pandas_datareader import data as pdr_data
+    STOOQ_AVAILABLE = True
+except ImportError:
+    STOOQ_AVAILABLE = False
+
+try:
+    from alpha_vantage.timeseries import TimeSeries as AV_TimeSeries
+    ALPHAVANTAGE_AVAILABLE = True
+except ImportError:
+    ALPHAVANTAGE_AVAILABLE = False
 
 # Add project root directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -241,7 +267,14 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
         if 'timestamps' in df.columns and len(historical_df) > 0:
             # Start from the last timestamp of historical data, create prediction timestamps with the same time interval
             last_timestamp = historical_df['timestamps'].iloc[-1]
-            time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0] if len(df) > 1 else pd.Timedelta(hours=1)
+            # Use median time diff to avoid weekend/holiday gap issues
+            if len(df) > 1:
+                diffs = df['timestamps'].diff().dropna()
+                time_diff = diffs.median() if len(diffs) > 0 else pd.Timedelta(hours=1)
+            else:
+                time_diff = pd.Timedelta(hours=1)
+            if time_diff <= pd.Timedelta(0):
+                time_diff = pd.Timedelta(days=1)
             
             pred_timestamps = pd.date_range(
                 start=last_timestamp + time_diff,
@@ -337,6 +370,330 @@ def get_data_files():
     """Get available data file list"""
     data_files = load_data_files()
     return jsonify(data_files)
+
+
+# ============ Stock data auto-download ============
+
+def _is_cn_ticker(symbol: str) -> bool:
+    """Check if symbol looks like a Chinese A-share ticker, e.g. 600977, sh600977, sz000001"""
+    s = symbol.strip().upper()
+    if re.match(r'^(SH|SZ)?\d{6}$', s):
+        return True
+    return False
+
+
+def _download_yfinance(symbol, start, end, interval):
+    """Download via yfinance (US / HK / crypto / global)"""
+    if not YFINANCE_AVAILABLE:
+        return None, 'yfinance is not installed'
+    try:
+        # Use yf.download() which is more robust than Ticker.history()
+        df = yf.download(
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            timeout=30
+        )
+        if df is None or len(df) == 0:
+            # yf.download prints errors to stderr but returns empty df
+            return None, f'yfinance returned no data for {symbol} (possible rate limit — wait 1-2 minutes and retry)'
+        df = df.reset_index()
+        # Normalize columns (handle both single and multi-level columns)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if c[1] == '' or c[1] == symbol else c[0] for c in df.columns]
+        rename_map = {}
+        for c in df.columns:
+            cl = str(c).lower().strip()
+            if cl in ('date', 'datetime'):
+                rename_map[c] = 'timestamps'
+            elif cl in ('open', 'high', 'low', 'close', 'volume'):
+                rename_map[c] = cl
+            elif cl == 'adj close':
+                rename_map[c] = 'adj_close'
+        df = df.rename(columns=rename_map)
+        if 'timestamps' not in df.columns:
+            df['timestamps'] = df.index
+        df['timestamps'] = pd.to_datetime(df['timestamps'])
+        # Keep only needed columns
+        keep = ['timestamps', 'open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            keep.append('volume')
+        df = df[[c for c in keep if c in df.columns]]
+        return df, None
+    except Exception as e:
+        err_msg = str(e)
+        if 'RateLimit' in err_msg or 'Too Many Requests' in err_msg:
+            return None, f'yfinance rate limited — please wait a moment and retry, or use akshare for Chinese stocks'
+        return None, f'yfinance error: {err_msg}'
+
+
+def _download_akshare_cn(symbol, start, end, interval):
+    """Download Chinese A-share data via akshare"""
+    if not AKSHARE_AVAILABLE:
+        return None, 'akshare is not installed'
+    try:
+        s = symbol.strip().upper()
+        # Strip prefix
+        code = re.sub(r'^(SH|SZ)', '', s)
+        # Map interval
+        ak_period_map = {
+            '1m': '1', '5m': '5', '15m': '15', '30m': '30', '60m': '60',
+            '1h': '60', '1d': 'daily', '1wk': 'weekly',
+        }
+        ak_period = ak_period_map.get(interval, 'daily')
+
+        if ak_period in ('daily', 'weekly'):
+            df = ak.stock_zh_a_hist(
+                symbol=code,
+                period='daily' if ak_period == 'daily' else 'weekly',
+                start_date=start.replace('-', ''),
+                end_date=end.replace('-', ''),
+                adjust='qfq'
+            )
+        else:
+            df = ak.stock_zh_a_hist_min_em(
+                symbol=code,
+                period=ak_period,
+                start_date=f"{start} 09:30:00",
+                end_date=f"{end} 15:00:00",
+                adjust='qfq'
+            )
+
+        if df is None or len(df) == 0:
+            return None, f'akshare returned no data for {symbol}'
+
+        # Normalize column names (akshare uses Chinese headers)
+        col_map = {}
+        for c in df.columns:
+            cl = c.strip()
+            if cl in ('日期', '时间', 'date', 'datetime', '日期时间'):
+                col_map[c] = 'timestamps'
+            elif cl in ('开盘', '开盘价', 'open'):
+                col_map[c] = 'open'
+            elif cl in ('最高', '最高价', 'high'):
+                col_map[c] = 'high'
+            elif cl in ('最低', '最低价', 'low'):
+                col_map[c] = 'low'
+            elif cl in ('收盘', '收盘价', 'close'):
+                col_map[c] = 'close'
+            elif cl in ('成交量', 'volume'):
+                col_map[c] = 'volume'
+            elif cl in ('成交额', 'amount'):
+                col_map[c] = 'amount'
+        df = df.rename(columns=col_map)
+        if 'timestamps' not in df.columns:
+            df['timestamps'] = df.index
+        df['timestamps'] = pd.to_datetime(df['timestamps'])
+        keep = ['timestamps', 'open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            keep.append('volume')
+        if 'amount' in df.columns:
+            keep.append('amount')
+        df = df[[c for c in keep if c in df.columns]]
+        return df, None
+    except Exception as e:
+        return None, f'akshare error: {str(e)}'
+
+
+def _download_stooq(symbol, start, end, interval):
+    """Download via Stooq (free, no API key, good for US/global daily data)"""
+    if not STOOQ_AVAILABLE:
+        return None, 'pandas-datareader is not installed (pip install pandas-datareader)'
+    if interval not in ('1d', 'daily'):
+        return None, 'Stooq only supports daily data'
+    try:
+        df = pdr_data.DataReader(symbol, 'stooq', start=start, end=end)
+        if df is None or len(df) == 0:
+            return None, f'Stooq returned no data for {symbol}'
+        df = df.sort_index()  # Stooq returns newest-first
+        df = df.reset_index()
+        rename_map = {}
+        for c in df.columns:
+            cl = str(c).lower().strip()
+            if cl == 'date':
+                rename_map[c] = 'timestamps'
+            elif cl in ('open', 'high', 'low', 'close', 'volume'):
+                rename_map[c] = cl
+        df = df.rename(columns=rename_map)
+        if 'timestamps' not in df.columns:
+            df['timestamps'] = df.index
+        df['timestamps'] = pd.to_datetime(df['timestamps'])
+        keep = ['timestamps', 'open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            keep.append('volume')
+        df = df[[c for c in keep if c in df.columns]]
+        return df, None
+    except Exception as e:
+        return None, f'Stooq error: {str(e)}'
+
+
+def _download_alphavantage(symbol, start, end, interval, api_key=None):
+    """Download via Alpha Vantage (requires free API key from alphavantage.co)"""
+    if not ALPHAVANTAGE_AVAILABLE:
+        return None, 'alpha_vantage is not installed (pip install alpha_vantage)'
+    if not api_key:
+        return None, 'Alpha Vantage requires an API key. Get a free key at https://www.alphavantage.co/support/#api-key'
+    try:
+        ts = AV_TimeSeries(key=api_key, output_format='pandas')
+        av_interval_map = {'1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '60m': '60min', '1h': '60min'}
+        if interval in av_interval_map:
+            df, _ = ts.get_intraday(symbol=symbol, interval=av_interval_map[interval], outputsize='full')
+        else:
+            df, _ = ts.get_daily(symbol=symbol, outputsize='full')
+        if df is None or len(df) == 0:
+            return None, f'Alpha Vantage returned no data for {symbol}'
+        df = df.sort_index()
+        df = df.reset_index()
+        rename_map = {}
+        for c in df.columns:
+            cl = str(c).lower().strip()
+            if cl in ('date', 'datetime'):
+                rename_map[c] = 'timestamps'
+            elif '1. open' in cl or cl == 'open':
+                rename_map[c] = 'open'
+            elif '2. high' in cl or cl == 'high':
+                rename_map[c] = 'high'
+            elif '3. low' in cl or cl == 'low':
+                rename_map[c] = 'low'
+            elif '4. close' in cl or cl == 'close':
+                rename_map[c] = 'close'
+            elif '5. volume' in cl or cl == 'volume':
+                rename_map[c] = 'volume'
+        df = df.rename(columns=rename_map)
+        if 'timestamps' not in df.columns:
+            df['timestamps'] = df.index
+        df['timestamps'] = pd.to_datetime(df['timestamps'])
+        # Filter by date range
+        df = df[(df['timestamps'] >= pd.to_datetime(start)) & (df['timestamps'] <= pd.to_datetime(end))]
+        keep = ['timestamps', 'open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            keep.append('volume')
+        df = df[[c for c in keep if c in df.columns]]
+        return df, None
+    except Exception as e:
+        return None, f'Alpha Vantage error: {str(e)}'
+
+
+@app.route('/api/download-stock', methods=['POST'])
+def download_stock():
+    """Download stock data by ticker + date range + interval, save to data/ and return info"""
+    try:
+        data = request.get_json()
+        symbol = data.get('symbol', '').strip()
+        start_date = data.get('start_date', '')
+        end_date = data.get('end_date', '')
+        interval = data.get('interval', '1d')
+        source = data.get('source', 'auto')  # auto / yfinance / akshare / stooq / alphavantage
+        api_key = data.get('api_key', '')  # For Alpha Vantage
+
+        if not symbol:
+            return jsonify({'error': 'Stock ticker cannot be empty'}), 400
+        if not start_date or not end_date:
+            return jsonify({'error': 'Start date and end date are required'}), 400
+
+        df = None
+        error = None
+
+        if source == 'auto':
+            # Auto-detect: Chinese A-share -> akshare first, otherwise try yfinance then Stooq
+            if _is_cn_ticker(symbol):
+                df, error = _download_akshare_cn(symbol, start_date, end_date, interval)
+                if df is None:
+                    df, error = _download_yfinance(symbol, start_date, end_date, interval)
+            else:
+                df, error = _download_yfinance(symbol, start_date, end_date, interval)
+                if df is None and STOOQ_AVAILABLE and interval in ('1d', 'daily'):
+                    df, error = _download_stooq(symbol, start_date, end_date, interval)
+                if df is None and AKSHARE_AVAILABLE:
+                    df, error = _download_akshare_cn(symbol, start_date, end_date, interval)
+        elif source == 'yfinance':
+            df, error = _download_yfinance(symbol, start_date, end_date, interval)
+        elif source == 'akshare':
+            df, error = _download_akshare_cn(symbol, start_date, end_date, interval)
+        elif source == 'stooq':
+            df, error = _download_stooq(symbol, start_date, end_date, interval)
+        elif source == 'alphavantage':
+            df, error = _download_alphavantage(symbol, start_date, end_date, interval, api_key=api_key)
+        else:
+            return jsonify({'error': f'Unknown source: {source}'}), 400
+
+        if df is None or len(df) == 0:
+            return jsonify({'error': f'Failed to download data: {error}'}), 400
+
+        # Ensure numeric
+        for col in ['open', 'high', 'low', 'close']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        if 'volume' in df.columns:
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        df = df.dropna(subset=['open', 'high', 'low', 'close'])
+        df = df.sort_values('timestamps').reset_index(drop=True)
+
+        if len(df) < 10:
+            return jsonify({'error': f'Insufficient data: only {len(df)} rows downloaded. Prediction requires at least 520 rows (lookback 400 + prediction 120). Please extend the date range.'}), 400
+
+        # Calculate minimum rows needed for prediction
+        MIN_ROWS_PREDICT = 520  # lookback(400) + pred_len(120)
+        MIN_ROWS_LOOKBACK = 400  # at least enough for lookback
+        data_warning = None
+        if len(df) < MIN_ROWS_PREDICT:
+            shortage = MIN_ROWS_PREDICT - len(df)
+            if len(df) < MIN_ROWS_LOOKBACK:
+                data_warning = f'⚠️ Downloaded {len(df)} rows, but prediction requires at least {MIN_ROWS_LOOKBACK} rows for lookback window. Please extend the date range to get ~{shortage} more data points.'
+            else:
+                data_warning = f'⚠️ Downloaded {len(df)} rows. Full prediction+comparison mode needs {MIN_ROWS_PREDICT} rows (short by {shortage}). Prediction will still work, but actual data comparison may be incomplete.'
+
+        # Save to data/
+        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        safe_symbol = re.sub(r'[^\w\-.]', '_', symbol)
+        filename = f"{safe_symbol}_{interval}_{start_date}_{end_date}.csv"
+        file_path = os.path.join(data_dir, filename)
+        df.to_csv(file_path, index=False)
+
+        return jsonify({
+            'success': True,
+            'file_path': file_path,
+            'filename': filename,
+            'rows': len(df),
+            'start': df['timestamps'].min().isoformat(),
+            'end': df['timestamps'].max().isoformat(),
+            'columns': list(df.columns),
+            'warning': data_warning,
+            'min_rows_needed': MIN_ROWS_PREDICT,
+            'message': f'Downloaded {len(df)} rows for {symbol} ({interval}), saved as {filename}'
+        })
+
+    except Exception as e:
+        return jsonify({'error': f'Download failed: {str(e)}'}), 500
+
+
+@app.route('/api/download-sources')
+def get_download_sources():
+    """Return available download sources"""
+    return jsonify({
+        'yfinance': YFINANCE_AVAILABLE,
+        'akshare': AKSHARE_AVAILABLE,
+        'stooq': STOOQ_AVAILABLE,
+        'alphavantage': ALPHAVANTAGE_AVAILABLE,
+        'presets': [
+            {'label': 'Apple (AAPL)', 'value': 'AAPL', 'source': 'yfinance'},
+            {'label': 'Tesla (TSLA)', 'value': 'TSLA', 'source': 'yfinance'},
+            {'label': 'NVIDIA (NVDA)', 'value': 'NVDA', 'source': 'yfinance'},
+            {'label': 'BTC/USD', 'value': 'BTC-USD', 'source': 'yfinance'},
+            {'label': 'ETH/USD', 'value': 'ETH-USD', 'source': 'yfinance'},
+            {'label': 'S&P 500 ETF (SPY)', 'value': 'SPY', 'source': 'yfinance'},
+            {'label': 'Alibaba HK (9988.HK)', 'value': '9988.HK', 'source': 'yfinance'},
+            {'label': 'Tencent HK (0700.HK)', 'value': '0700.HK', 'source': 'yfinance'},
+            {'label': '贵州茅台 (600519)', 'value': '600519', 'source': 'akshare'},
+            {'label': '中国海洋石油 (600977)', 'value': '600977', 'source': 'akshare'},
+            {'label': '宁德时代 (300750)', 'value': '300750', 'source': 'akshare'},
+            {'label': '比亚迪 (002594)', 'value': '002594', 'source': 'akshare'},
+        ]
+    })
 
 @app.route('/api/load-data', methods=['POST'])
 def load_data():
@@ -467,7 +824,25 @@ def predict():
                     # Use latest data
                     x_df = df.iloc[:lookback][required_cols]
                     x_timestamp = df.iloc[:lookback]['timestamps']
-                    y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
+                    
+                    # Ensure y_timestamp has exactly pred_len entries
+                    available_y = df.iloc[lookback:lookback+pred_len]
+                    if len(available_y) >= pred_len:
+                        y_timestamp = available_y['timestamps']
+                    else:
+                        # Not enough actual data — generate future timestamps
+                        last_ts = df['timestamps'].iloc[lookback - 1] if lookback <= len(df) else df['timestamps'].iloc[-1]
+                        if len(df) > 1:
+                            diffs = df['timestamps'].diff().dropna()
+                            time_diff = diffs.median()  # Use median to avoid weekend gaps
+                        else:
+                            time_diff = pd.Timedelta(hours=1)
+                        if time_diff <= pd.Timedelta(0):
+                            time_diff = pd.Timedelta(days=1)
+                        y_timestamp = pd.Series(
+                            pd.date_range(start=last_ts + time_diff, periods=pred_len, freq=time_diff),
+                            name='timestamps'
+                        )
                     prediction_type = "Kronos model prediction (latest data)"
                 
                 # Ensure timestamps are Series format, not DatetimeIndex, to avoid .dt attribute error in Kronos model
@@ -548,6 +923,16 @@ def predict():
         chart_json = create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
         
         # Prepare prediction result data - fix timestamp calculation logic
+        def _safe_time_diff(dataframe):
+            """Calculate a safe time difference using median to avoid weekend/holiday gaps"""
+            if len(dataframe) < 2 or 'timestamps' not in dataframe.columns:
+                return pd.Timedelta(days=1)
+            diffs = dataframe['timestamps'].diff().dropna()
+            td = diffs.median() if len(diffs) > 0 else pd.Timedelta(days=1)
+            if td <= pd.Timedelta(0):
+                td = pd.Timedelta(days=1)
+            return td
+
         if 'timestamps' in df.columns:
             if start_date:
                 # Custom time period: use selected window data to calculate timestamps
@@ -556,9 +941,8 @@ def predict():
                 time_range_df = df[mask]
                 
                 if len(time_range_df) >= lookback:
-                    # Calculate prediction timestamps starting from last time point of selected window
                     last_timestamp = time_range_df['timestamps'].iloc[lookback-1]
-                    time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
+                    time_diff = _safe_time_diff(df)
                     future_timestamps = pd.date_range(
                         start=last_timestamp + time_diff,
                         periods=pred_len,
@@ -567,9 +951,9 @@ def predict():
                 else:
                     future_timestamps = []
             else:
-                # Latest data: calculate from last time point of entire data file
-                last_timestamp = df['timestamps'].iloc[-1]
-                time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
+                # Latest data: calculate from last time point of lookback window
+                last_timestamp = df['timestamps'].iloc[min(lookback - 1, len(df) - 1)]
+                time_diff = _safe_time_diff(df)
                 future_timestamps = pd.date_range(
                     start=last_timestamp + time_diff,
                     periods=pred_len,
@@ -639,18 +1023,34 @@ def load_model():
         if model_key not in AVAILABLE_MODELS:
             return jsonify({'error': f'Unsupported model: {model_key}'}), 400
         
+        # Validate CUDA availability — auto-fallback to CPU if not available
+        actual_device = device
+        import torch
+        if 'cuda' in device and not torch.cuda.is_available():
+            actual_device = 'cpu'
+            print(f'⚠️ CUDA requested but not available, falling back to CPU')
+        
         model_config = AVAILABLE_MODELS[model_key]
         
         # Load tokenizer and model
         tokenizer = KronosTokenizer.from_pretrained(model_config['tokenizer_id'])
         model = Kronos.from_pretrained(model_config['model_id'])
         
-        # Create predictor
-        predictor = KronosPredictor(model, tokenizer, device=device, max_context=model_config['context_length'])
+        # Create predictor — try requested device, fallback to CPU on failure
+        try:
+            predictor = KronosPredictor(model, tokenizer, device=actual_device, max_context=model_config['context_length'])
+        except RuntimeError as cuda_err:
+            if 'CUDA' in str(cuda_err) or 'cuda' in str(cuda_err):
+                print(f'⚠️ CUDA error: {cuda_err}, falling back to CPU')
+                actual_device = 'cpu'
+                predictor = KronosPredictor(model, tokenizer, device='cpu', max_context=model_config['context_length'])
+            else:
+                raise
         
+        fallback_msg = f' (CUDA not available, auto-fallback to CPU)' if actual_device != device else ''
         return jsonify({
             'success': True,
-            'message': f'Model loaded successfully: {model_config["name"]} ({model_config["params"]}) on {device}',
+            'message': f'Model loaded successfully: {model_config["name"]} ({model_config["params"]}) on {actual_device}{fallback_msg}',
             'model_info': {
                 'name': model_config['name'],
                 'params': model_config['params'],

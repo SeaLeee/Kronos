@@ -48,6 +48,10 @@ Desktop.ini
 *.parquet
 *.h5
 *.hdf5
+data/*.csv
+
+# Prediction results (generated at runtime)
+webui/prediction_results/*.json
 
 # Model files (large files)
 *.pth

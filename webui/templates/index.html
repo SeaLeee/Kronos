@@ -481,13 +481,84 @@
 
                 <hr style="margin: 20px 0; border: 1px solid #e2e8f0;">
 
+                <!-- ====== Online Stock Download ====== -->
+                <div class="time-window-container" style="background: #edf2f7;">
+                    <h3>📡 Online Stock Download</h3>
+
+                    <div class="form-group" style="margin-bottom:12px;">
+                        <label for="stock-preset">Quick Select:</label>
+                        <select id="stock-preset" style="width:100%;padding:8px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;">
+                            <option value="">-- or type your own ticker below --</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group" style="margin-bottom:12px;">
+                        <label for="stock-symbol">Ticker / Code:</label>
+                        <input type="text" id="stock-symbol" placeholder="e.g. AAPL, BTC-USD, 600519, 9988.HK" style="width:100%;padding:8px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;">
+                        <small class="form-text">US stocks: AAPL; Crypto: BTC-USD; HK: 9988.HK; A-share: 600519</small>
+                    </div>
+
+                    <div id="download-date-hint" style="background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:13px;color:#856404;">
+                        💡 <b>Minimum date range guide</b> (need ≥520 data points):<br>
+                        Daily: ≥3 years &nbsp;|&nbsp; 1h: ≥4 months &nbsp;|&nbsp; 5min: ≥8 trading days &nbsp;|&nbsp; Weekly: ≥10 years
+                    </div>
+
+                    <div style="display:flex;gap:10px;margin-bottom:12px;">
+                        <div class="form-group" style="flex:1;margin-bottom:0;">
+                            <label for="stock-start">Start Date:</label>
+                            <input type="date" id="stock-start" style="width:100%;padding:8px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;">
+                        </div>
+                        <div class="form-group" style="flex:1;margin-bottom:0;">
+                            <label for="stock-end">End Date:</label>
+                            <input type="date" id="stock-end" style="width:100%;padding:8px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;">
+                        </div>
+                    </div>
+
+                    <div style="display:flex;gap:10px;margin-bottom:12px;">
+                        <div class="form-group" style="flex:1;margin-bottom:0;">
+                            <label for="stock-interval">Interval:</label>
+                            <select id="stock-interval" style="width:100%;padding:8px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;">
+                                <option value="1m">1 min</option>
+                                <option value="5m">5 min</option>
+                                <option value="15m">15 min</option>
+                                <option value="30m">30 min</option>
+                                <option value="1h">1 hour</option>
+                                <option value="1d" selected>1 day</option>
+                                <option value="1wk">1 week</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="flex:1;margin-bottom:0;">
+                            <label for="stock-source">Data Source:</label>
+                            <select id="stock-source" style="width:100%;padding:8px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;">
+                                <option value="auto">Auto Detect</option>
+                                <option value="yfinance">yfinance (Global)</option>
+                                <option value="stooq">Stooq (US/Global Daily, Free)</option>
+                                <option value="alphavantage">Alpha Vantage (API Key)</option>
+                                <option value="akshare">akshare (A-share)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div id="av-api-key-group" class="form-group" style="display:none;margin-bottom:10px;">
+                        <label for="av-api-key">Alpha Vantage API Key:</label>
+                        <input type="text" id="av-api-key" placeholder="Get free key at alphavantage.co" style="width:100%;padding:8px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;">
+                    </div>
+
+                    <button id="download-stock-btn" class="btn btn-warning">
+                        ⬇️ Download & Load
+                    </button>
+                    <div id="download-status" class="status info" style="display:none;margin-top:10px;"></div>
+                </div>
+
+                <hr style="margin: 20px 0; border: 1px solid #e2e8f0;">
+
                 <!-- Data File Selection -->
                 <div class="form-group">
                     <label for="data-file-select">Select Data File:</label>
                     <select id="data-file-select">
                         <option value="">Please load data file list first</option>
                     </select>
-                    <small class="form-text">Select K-line data file from data directory</small>
+                    <small class="form-text">Select K-line data file from data directory (includes downloaded files)</small>
                 </div>
 
                 <button id="load-data-btn" class="btn btn-secondary">
@@ -654,6 +725,12 @@
             
             // Load data file list
             await loadDataFiles();
+
+            // Load stock download presets
+            await loadStockPresets();
+            
+            // Set default dates for stock download (last 2 years)
+            setDefaultStockDates();
             
             // Set up event listeners
             setupEventListeners();
@@ -1209,6 +1286,154 @@
             // Update slider when lookback window size changes
             document.getElementById('lookback').addEventListener('input', updateSliderFromInputs);
             document.getElementById('pred-len').addEventListener('input', updateSliderFromInputs);
+
+            // Stock download button
+            document.getElementById('download-stock-btn').addEventListener('click', downloadStock);
+
+            // Stock preset quick-select
+            document.getElementById('stock-preset').addEventListener('change', function() {
+                if (this.value) {
+                    document.getElementById('stock-symbol').value = this.value;
+                }
+            });
+
+            // Toggle Alpha Vantage API key field visibility
+            document.getElementById('stock-source').addEventListener('change', function() {
+                const avGroup = document.getElementById('av-api-key-group');
+                avGroup.style.display = this.value === 'alphavantage' ? 'block' : 'none';
+            });
+        }
+
+        // ---------- Stock Download Functions ----------
+
+        function setDefaultStockDates() {
+            const today = new Date();
+            const threeYearsAgo = new Date();
+            threeYearsAgo.setFullYear(today.getFullYear() - 3);
+            document.getElementById('stock-end').value = today.toISOString().split('T')[0];
+            document.getElementById('stock-start').value = threeYearsAgo.toISOString().split('T')[0];
+        }
+
+        async function loadStockPresets() {
+            try {
+                const response = await axios.get('/api/download-sources');
+                const data = response.data;
+                const presetSelect = document.getElementById('stock-preset');
+                presetSelect.innerHTML = '<option value="">-- Quick select a stock --</option>';
+                if (data.presets) {
+                    data.presets.forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p.value;
+                        opt.textContent = p.label;
+                        presetSelect.appendChild(opt);
+                    });
+                }
+                // Disable unavailable sources
+                const sourceSelect = document.getElementById('stock-source');
+                if (!data.yfinance) {
+                    const opt = sourceSelect.querySelector('option[value="yfinance"]');
+                    if (opt) opt.disabled = true;
+                }
+                if (!data.akshare) {
+                    const opt = sourceSelect.querySelector('option[value="akshare"]');
+                    if (opt) opt.disabled = true;
+                }
+                if (!data.stooq) {
+                    const opt = sourceSelect.querySelector('option[value="stooq"]');
+                    if (opt) opt.disabled = true;
+                }
+                if (!data.alphavantage) {
+                    const opt = sourceSelect.querySelector('option[value="alphavantage"]');
+                    if (opt) opt.disabled = true;
+                }
+                console.log('✅ Stock presets loaded');
+            } catch (error) {
+                console.warn('⚠️ Could not load stock presets:', error);
+            }
+        }
+
+        async function downloadStock() {
+            const symbol = document.getElementById('stock-symbol').value.trim();
+            const startDate = document.getElementById('stock-start').value;
+            const endDate = document.getElementById('stock-end').value;
+            const interval = document.getElementById('stock-interval').value;
+            const source = document.getElementById('stock-source').value;
+
+            if (!symbol) {
+                showDownloadStatus('error', 'Please enter a stock ticker or select from the presets');
+                return;
+            }
+            if (!startDate || !endDate) {
+                showDownloadStatus('error', 'Please select start and end dates');
+                return;
+            }
+
+            try {
+                showLoading(true);
+                document.getElementById('download-stock-btn').disabled = true;
+                showDownloadStatus('info', `Downloading ${symbol} data...`);
+
+                const response = await axios.post('/api/download-stock', {
+                    symbol: symbol,
+                    start_date: startDate,
+                    end_date: endDate,
+                    interval: interval,
+                    source: source,
+                    api_key: document.getElementById('av-api-key')?.value || ''
+                });
+
+                if (response.data.success) {
+                    let statusMsg = response.data.message;
+                    let statusType = 'success';
+                    
+                    // Show data sufficiency warning
+                    if (response.data.warning) {
+                        statusMsg += '\n' + response.data.warning;
+                        statusType = 'warning';
+                    } else if (response.data.rows >= 520) {
+                        statusMsg += ` ✅ Data sufficient for prediction (${response.data.rows} ≥ 520 rows needed)`;
+                    }
+                    
+                    showDownloadStatus(statusType, statusMsg);
+
+                    // Refresh file list
+                    await loadDataFiles();
+
+                    // Auto-select the newly downloaded file
+                    const fileSelect = document.getElementById('data-file-select');
+                    const options = fileSelect.options;
+                    for (let i = 0; i < options.length; i++) {
+                        if (options[i].value === response.data.file_path) {
+                            fileSelect.selectedIndex = i;
+                            break;
+                        }
+                    }
+
+                    // Auto-load the data
+                    await loadData();
+                } else {
+                    showDownloadStatus('error', response.data.error || 'Download failed');
+                }
+            } catch (error) {
+                console.error('❌ Stock download failed:', error);
+                showDownloadStatus('error', `Download failed: ${error.response?.data?.error || error.message}`);
+            } finally {
+                showLoading(false);
+                document.getElementById('download-stock-btn').disabled = false;
+            }
+        }
+
+        function showDownloadStatus(type, msg) {
+            const el = document.getElementById('download-status');
+            el.className = `status ${type}`;
+            el.style.whiteSpace = 'pre-line';
+            el.textContent = msg;
+            el.style.display = 'block';
+            if (type === 'success') {
+                setTimeout(() => { el.style.display = 'none'; }, 8000);
+            } else if (type === 'warning') {
+                setTimeout(() => { el.style.display = 'none'; }, 15000);
+            }
         }
 
         // Display status information
